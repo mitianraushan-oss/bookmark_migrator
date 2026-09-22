@@ -1,27 +1,51 @@
 """
 Bookmark Migrator - Extract and Import bookmarks from Chrome and Edge browsers
 Allows you to backup bookmarks and restore them on a new computer
+Cross-platform: Windows, macOS, and Linux (requires Python 3 + tkinter, no extra dependencies)
 """
 
 import json
 import os
+import platform
 import shutil
 import subprocess
+import threading
+import queue
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from datetime import datetime
 from urllib.parse import urlparse
+import urllib.request
+import urllib.error
+import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 
 class BookmarkMigrator:
     def __init__(self):
-        self.chrome_bookmark_path = os.path.expanduser(
-            "~\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Bookmarks"
-        )
-        self.edge_bookmark_path = os.path.expanduser(
-            "~\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Bookmarks"
-        )
+        system = platform.system()
+        if system == "Windows":
+            self.chrome_bookmark_path = os.path.expanduser(
+                r"~\AppData\Local\Google\Chrome\User Data\Default\Bookmarks"
+            )
+            self.edge_bookmark_path = os.path.expanduser(
+                r"~\AppData\Local\Microsoft\Edge\User Data\Default\Bookmarks"
+            )
+        elif system == "Darwin":  # macOS
+            self.chrome_bookmark_path = os.path.expanduser(
+                "~/Library/Application Support/Google/Chrome/Default/Bookmarks"
+            )
+            self.edge_bookmark_path = os.path.expanduser(
+                "~/Library/Application Support/Microsoft Edge/Default/Bookmarks"
+            )
+        else:  # Linux
+            self.chrome_bookmark_path = os.path.expanduser(
+                "~/.config/google-chrome/Default/Bookmarks"
+            )
+            self.edge_bookmark_path = os.path.expanduser(
+                "~/.config/microsoft-edge/Default/Bookmarks"
+            )
         self.export_dir = os.path.expanduser("~/Bookmarks_Backup")
         os.makedirs(self.export_dir, exist_ok=True)
         
@@ -296,26 +320,42 @@ class BookmarkMigrator:
                 self._add_to_existing(child, existing_urls)
     
     def is_browser_running(self, browser_type):
-        """Check via tasklist whether the browser process is still running
+        """Check whether the browser process is still running, cross-platform
         (Edge/Chrome can keep running in the background even after all windows are closed)"""
-        process_name = "msedge.exe" if browser_type == "edge" else "chrome.exe"
+        system = platform.system()
         try:
-            result = subprocess.run(
-                ["tasklist", "/FI", f"IMAGENAME eq {process_name}"],
-                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            return process_name.lower() in result.stdout.lower()
+            if system == "Windows":
+                process_name = "msedge.exe" if browser_type == "edge" else "chrome.exe"
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"IMAGENAME eq {process_name}"],
+                    capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                return process_name.lower() in result.stdout.lower()
+            else:
+                names = ["Microsoft Edge", "msedge", "microsoft-edge"] if browser_type == "edge" \
+                    else ["Google Chrome", "chrome", "google-chrome"]
+                for name in names:
+                    result = subprocess.run(["pgrep", "-f", name], capture_output=True, text=True)
+                    if result.returncode == 0 and result.stdout.strip():
+                        return True
+                return False
         except Exception:
             return False
 
     def close_browser_processes(self, browser_type, timeout=10):
-        """Force-close all instances of the browser (including background processes)"""
-        process_name = "msedge.exe" if browser_type == "edge" else "chrome.exe"
+        """Force-close all instances of the browser (including background processes), cross-platform"""
+        system = platform.system()
         try:
-            subprocess.run(
-                ["taskkill", "/IM", process_name, "/F", "/T"],
-                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
-            )
+            if system == "Windows":
+                process_name = "msedge.exe" if browser_type == "edge" else "chrome.exe"
+                subprocess.run(
+                    ["taskkill", "/IM", process_name, "/F", "/T"],
+                    capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+                )
+            else:
+                names = ["Microsoft Edge", "msedge"] if browser_type == "edge" else ["Google Chrome", "google-chrome"]
+                for name in names:
+                    subprocess.run(["pkill", "-f", name], capture_output=True, text=True)
         except Exception:
             pass
         
@@ -665,12 +705,348 @@ class BookmarkMigrator:
         except Exception as e:
             return False, f"Error organizing bookmarks: {str(e)}"
 
+    ROOT_DISPLAY = {'bookmark_bar': 'Bookmarks Bar', 'other': 'Other Bookmarks', 'synced': 'Mobile Bookmarks'}
+
+    def _load_bookmark_data(self, browser_type):
+        bookmark_file = self.chrome_bookmark_path if browser_type == "chrome" else self.edge_bookmark_path
+        browser_name = "Chrome" if browser_type == "chrome" else "Edge"
+        if not os.path.exists(bookmark_file):
+            return None, None, None, f"{browser_name} bookmarks file not found"
+        try:
+            with open(bookmark_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            return None, None, None, f"Error reading bookmarks: {str(e)}"
+        return data, bookmark_file, browser_name, None
+
+    def search_bookmarks(self, browser_type, query):
+        """Search bookmark titles/URLs (case-insensitive) across all folders"""
+        data, _, _, error = self._load_bookmark_data(browser_type)
+        if error:
+            return None, error
+        
+        query_lower = query.strip().lower()
+        results = []
+        
+        def walk(node, path_parts):
+            for child in node.get('children', []):
+                if child.get('type') == 'url':
+                    name, url = child.get('name', ''), child.get('url', '')
+                    if query_lower in name.lower() or query_lower in url.lower():
+                        results.append({
+                            'id': child.get('id', ''),
+                            'name': name,
+                            'url': url,
+                            'path': ' / '.join(path_parts)
+                        })
+                elif child.get('type') == 'folder':
+                    walk(child, path_parts + [child.get('name', '(unnamed)')])
+        
+        for root_key in ['bookmark_bar', 'other', 'synced']:
+            root = data.get('roots', {}).get(root_key)
+            if root:
+                walk(root, [self.ROOT_DISPLAY[root_key]])
+        
+        return results, None
+
+    def list_folder_paths(self, browser_type):
+        """Return breadcrumb-style folder paths (e.g. 'Bookmarks Bar / Work / Projects') for a folder picker"""
+        data, _, _, error = self._load_bookmark_data(browser_type)
+        if error:
+            return None, error
+        
+        paths = []
+        
+        def walk(node, path_parts):
+            for child in node.get('children', []):
+                if child.get('type') == 'folder':
+                    new_path = path_parts + [child.get('name', '(unnamed)')]
+                    paths.append(' / '.join(new_path))
+                    walk(child, new_path)
+        
+        for root_key in ['bookmark_bar', 'other', 'synced']:
+            root = data.get('roots', {}).get(root_key)
+            if root:
+                display = self.ROOT_DISPLAY[root_key]
+                paths.append(display)
+                walk(root, [display])
+        
+        return paths, None
+
+    def add_bookmark_to_folder(self, browser_type, folder_path, name, url):
+        """Add a new bookmark to an existing folder identified by its breadcrumb path"""
+        data, bookmark_file, browser_name, error = self._load_bookmark_data(browser_type)
+        if error:
+            return False, error
+        
+        if self.is_browser_running(browser_type):
+            return False, (
+                f"{browser_name} is still running (possibly in the background) and will "
+                f"overwrite this file with its in-memory bookmarks. Please fully quit "
+                f"{browser_name} before adding bookmarks."
+            )
+        
+        parts = [p.strip() for p in folder_path.split('/')]
+        reverse_root = {v: k for k, v in self.ROOT_DISPLAY.items()}
+        if not parts or parts[0] not in reverse_root:
+            return False, f"Invalid folder path: {folder_path}"
+        
+        node = data['roots'][reverse_root[parts[0]]]
+        for part in parts[1:]:
+            match = next((c for c in node.get('children', []) if c.get('type') == 'folder' and c.get('name') == part), None)
+            if not match:
+                return False, f"Folder not found: {folder_path}"
+            node = match
+        
+        backup_file = bookmark_file + ".backup"
+        try:
+            shutil.copy2(bookmark_file, backup_file)
+        except Exception as e:
+            return False, f"Error backing up bookmarks: {str(e)}"
+        
+        next_id = self._next_id_generator(data)
+        new_bookmark = {
+            'type': 'url',
+            'id': next_id(),
+            'name': name,
+            'url': url,
+            'date_added': str(int((time.time() + 11644473600) * 1000000))
+        }
+        node.setdefault('children', []).append(new_bookmark)
+        data['checksum'] = "00000000000000000000000000000000"
+        
+        try:
+            with open(bookmark_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            return False, f"Error saving bookmarks: {str(e)}"
+        
+        return True, f"✅ Added '{name}' to {folder_path} in {browser_name}. Backup saved to {backup_file}"
+
+    def update_bookmark(self, browser_type, bookmark_id, new_name=None, new_url=None):
+        """Update the name and/or URL of an existing bookmark, identified by its stable id
+        (used to fix broken/changed links found via search)"""
+        data, bookmark_file, browser_name, error = self._load_bookmark_data(browser_type)
+        if error:
+            return False, error
+        
+        if self.is_browser_running(browser_type):
+            return False, (
+                f"{browser_name} is still running (possibly in the background) and will "
+                f"overwrite this file with its in-memory bookmarks. Please fully quit "
+                f"{browser_name} before editing bookmarks."
+            )
+        
+        target = None
+        
+        def find(node):
+            nonlocal target
+            for child in node.get('children', []):
+                if target is not None:
+                    return
+                if child.get('type') == 'url' and str(child.get('id', '')) == str(bookmark_id):
+                    target = child
+                    return
+                elif child.get('type') == 'folder':
+                    find(child)
+        
+        for root_key in ['bookmark_bar', 'other', 'synced']:
+            if target is not None:
+                break
+            root = data.get('roots', {}).get(root_key)
+            if root:
+                find(root)
+        
+        if target is None:
+            return False, "Bookmark not found (it may have been moved or removed since searching)."
+        
+        backup_file = bookmark_file + ".backup"
+        try:
+            shutil.copy2(bookmark_file, backup_file)
+        except Exception as e:
+            return False, f"Error backing up bookmarks: {str(e)}"
+        
+        if new_name is not None and new_name.strip():
+            target['name'] = new_name.strip()
+        if new_url is not None and new_url.strip():
+            target['url'] = new_url.strip()
+        data['checksum'] = "00000000000000000000000000000000"
+        
+        try:
+            with open(bookmark_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            return False, f"Error saving bookmarks: {str(e)}"
+        
+        return True, f"✅ Updated bookmark in {browser_name}. Backup saved to {backup_file}"
+
+    def delete_bookmark(self, browser_type, bookmark_id):
+        """Remove a single bookmark identified by its stable id"""
+        data, bookmark_file, browser_name, error = self._load_bookmark_data(browser_type)
+        if error:
+            return False, error
+        
+        if self.is_browser_running(browser_type):
+            return False, (
+                f"{browser_name} is still running (possibly in the background) and will "
+                f"overwrite this file with its in-memory bookmarks. Please fully quit "
+                f"{browser_name} before removing bookmarks."
+            )
+        
+        target_parent, target_node = None, None
+        
+        def find(node):
+            nonlocal target_parent, target_node
+            children = node.get('children', [])
+            for child in children:
+                if target_node is not None:
+                    return
+                if child.get('type') == 'url' and str(child.get('id', '')) == str(bookmark_id):
+                    target_parent, target_node = children, child
+                    return
+                elif child.get('type') == 'folder':
+                    find(child)
+        
+        for root_key in ['bookmark_bar', 'other', 'synced']:
+            if target_node is not None:
+                break
+            root = data.get('roots', {}).get(root_key)
+            if root:
+                find(root)
+        
+        if target_node is None:
+            return False, "Bookmark not found (it may have been moved or removed since searching)."
+        
+        backup_file = bookmark_file + ".backup"
+        try:
+            shutil.copy2(bookmark_file, backup_file)
+        except Exception as e:
+            return False, f"Error backing up bookmarks: {str(e)}"
+        
+        target_parent[:] = [c for c in target_parent if c is not target_node]
+        data['checksum'] = "00000000000000000000000000000000"
+        
+        try:
+            with open(bookmark_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            return False, f"Error saving bookmarks: {str(e)}"
+        
+        return True, f"✅ Removed bookmark from {browser_name}. Backup saved to {backup_file}"
+
+    @staticmethod
+    def _check_single_url(url, timeout=6):
+        """Check a single URL's reachability. Returns (status, code) where status is
+        'ok', 'broken' (reachable but error response), 'error' (unreachable/timeout), or 'skipped'"""
+        if not url or not url.lower().startswith(('http://', 'https://')):
+            return 'skipped', None
+        
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) BookmarkChecker/1.0'}
+        
+        def request(method):
+            req = urllib.request.Request(url, method=method, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.getcode()
+        
+        try:
+            code = request('HEAD')
+            return ('ok', code) if code < 400 else ('broken', code)
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 405, 501):
+                try:
+                    code2 = request('GET')
+                    return ('ok', code2) if code2 < 400 else ('broken', code2)
+                except urllib.error.HTTPError as e2:
+                    return 'broken', e2.code
+                except Exception:
+                    return 'error', e.code
+            return ('ok', e.code) if e.code < 400 else ('broken', e.code)
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ValueError):
+            return 'error', None
+        except Exception:
+            return 'error', None
+
+    def check_bookmark_links(self, browser_type, progress_callback=None, max_workers=10, timeout=6):
+        """Check every bookmark's URL for reachability. Returns a list of bookmark dicts
+        (id/name/url/path) each annotated with 'status' ('ok'/'broken'/'error'/'skipped') and 'code'"""
+        bookmarks, error = self.search_bookmarks(browser_type, '')
+        if error:
+            return None, error
+        
+        total = len(bookmarks)
+        done = 0
+        results = []
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_bm = {executor.submit(self._check_single_url, bm['url'], timeout): bm for bm in bookmarks}
+            for future in as_completed(future_to_bm):
+                bm = future_to_bm[future]
+                status, code = future.result()
+                results.append({**bm, 'status': status, 'code': code})
+                done += 1
+                if progress_callback:
+                    progress_callback(done, total)
+        
+        return results, None
+
+    def open_url_in_browser(self, browser_type, url):
+        """Open a URL in the specified browser (Edge or Chrome), cross-platform,
+        falling back to the OS default handler if the browser can't be located"""
+        system = platform.system()
+        
+        if system == "Darwin":
+            app_name = "Microsoft Edge" if browser_type == "edge" else "Google Chrome"
+            try:
+                subprocess.Popen(["open", "-a", app_name, url])
+                return True, None
+            except Exception as e:
+                return False, str(e)
+        
+        if system == "Windows":
+            candidates = {
+                'edge': [
+                    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+                ],
+                'chrome': [
+                    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+                ],
+            }
+            for exe in candidates.get(browser_type, []):
+                if os.path.exists(exe):
+                    try:
+                        subprocess.Popen([exe, url])
+                        return True, None
+                    except Exception as e:
+                        return False, str(e)
+            
+            try:
+                os.startfile(url)
+                return True, None
+            except Exception as e:
+                return False, str(e)
+        
+        # Linux
+        binary = "microsoft-edge" if browser_type == "edge" else "google-chrome"
+        try:
+            subprocess.Popen([binary, url])
+            return True, None
+        except Exception:
+            try:
+                subprocess.Popen(["xdg-open", url])
+                return True, None
+            except Exception as e:
+                return False, str(e)
+
 
 class BookmarkMigratorGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("📚 Bookmark Migrator - Extract & Import Bookmarks")
-        self.root.geometry("600x500")
+        self.root.geometry("680x620")
         self.root.resizable(True, True)
         
         self.migrator = BookmarkMigrator()
@@ -727,6 +1103,17 @@ class BookmarkMigratorGUI:
         ttk.Button(cleanup_frame, text="📂 Organize Loose Bookmarks", 
                   command=self.organize_loose_bookmarks_prompt).pack(side="left", padx=5)
         
+        # Manage Bookmarks Section
+        manage_frame = ttk.LabelFrame(self.root, text="🔗 Manage Bookmarks", padding=10)
+        manage_frame.pack(pady=10, padx=10, fill="both", expand=False)
+        
+        ttk.Button(manage_frame, text="🔎 Search Bookmarks", 
+                  command=self.search_bookmarks_dialog).pack(side="left", padx=5)
+        ttk.Button(manage_frame, text="➕ Add Bookmark to Folder", 
+                  command=self.add_bookmark_dialog).pack(side="left", padx=5)
+        ttk.Button(manage_frame, text="🩺 Check Broken Links", 
+                  command=self.check_broken_links_dialog).pack(side="left", padx=5)
+        
         # Instructions Section
         instructions_frame = ttk.LabelFrame(self.root, text="📋 Instructions", padding=10)
         instructions_frame.pack(pady=10, padx=10, fill="both", expand=True)
@@ -759,6 +1146,9 @@ ADDITIONAL FEATURES:
 - "Clean Empty Folders" - Manually remove empty bookmark folders
 - "Remove Duplicate Bookmarks" - Keep only 1 copy of each URL and merge folders that share a name (asks for confirmation first)
 - "Organize Loose Bookmarks" - Groups bookmarks sitting directly in the bar/other/synced roots (not inside any folder) into new folders named after their site domain, so you can rename/rearrange them afterward
+- "Search Bookmarks" - Find bookmarks by title or URL across all folders, open them, or edit a broken/changed URL
+- "Add Bookmark to Folder" - Manually add a new bookmark into any existing folder
+- "Check Broken Links" - Test every bookmark's URL and flag ones that return errors or can't be reached, so you can fix or remove them
 
 IMPORTANT:
 - Always close the browser before importing
@@ -953,6 +1343,318 @@ IMPORTANT:
         else:
             messagebox.showerror("❌ Error", message)
     
+    def search_bookmarks_dialog(self):
+        """Open a dialog to search bookmarks by title/URL across all folders"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("🔎 Search Bookmarks")
+        dialog.geometry("560x420")
+        dialog.transient(self.root)
+        
+        top = ttk.Frame(dialog, padding=10)
+        top.pack(fill="x")
+        
+        ttk.Label(top, text="Browser:").grid(row=0, column=0, sticky="w", padx=(0, 5))
+        browser_var = tk.StringVar(value="edge")
+        browser_combo = ttk.Combobox(top, textvariable=browser_var, values=["edge", "chrome"], state="readonly", width=10)
+        browser_combo.grid(row=0, column=1, padx=(0, 15))
+        
+        ttk.Label(top, text="Search:").grid(row=0, column=2, sticky="w", padx=(0, 5))
+        query_var = tk.StringVar()
+        query_entry = ttk.Entry(top, textvariable=query_var, width=30)
+        query_entry.grid(row=0, column=3, padx=(0, 10))
+        query_entry.focus_set()
+        
+        results_frame = ttk.Frame(dialog, padding=(10, 0, 10, 10))
+        results_frame.pack(fill="both", expand=True)
+        
+        columns = ("name", "url", "path")
+        tree = ttk.Treeview(results_frame, columns=columns, show="headings")
+        tree.heading("name", text="Name")
+        tree.heading("url", text="URL")
+        tree.heading("path", text="Folder")
+        tree.column("name", width=140)
+        tree.column("url", width=220)
+        tree.column("path", width=160)
+        tree.pack(side="left", fill="both", expand=True)
+        
+        scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        tree.config(yscrollcommand=scrollbar.set)
+        
+        def do_search():
+            query = query_var.get().strip()
+            if not query:
+                messagebox.showwarning("⚠️ Missing Input", "Enter something to search for.")
+                return
+            results, error = self.migrator.search_bookmarks(browser_var.get(), query)
+            tree.delete(*tree.get_children())
+            if error:
+                messagebox.showerror("❌ Error", error)
+                return
+            if not results:
+                messagebox.showinfo("No Results", f"No bookmarks matched '{query}'.")
+                return
+            for r in results:
+                tree.insert("", "end", iid=str(r['id']), values=(r['name'], r['url'], r['path']))
+        
+        ttk.Button(top, text="Search", command=do_search).grid(row=0, column=4)
+        query_entry.bind("<Return>", lambda e: do_search())
+        
+        def open_selected(event=None):
+            selection = tree.selection()
+            if not selection:
+                return
+            url = tree.item(selection[0], "values")[1]
+            success, error = self.migrator.open_url_in_browser(browser_var.get(), url)
+            if not success:
+                messagebox.showerror("❌ Error", f"Could not open URL: {error}")
+        
+        tree.bind("<Double-1>", open_selected)
+        
+        def edit_selected():
+            selection = tree.selection()
+            if not selection:
+                messagebox.showwarning("⚠️ Nothing Selected", "Select a bookmark to edit first.")
+                return
+            bookmark_id = selection[0]
+            current_name, current_url, _ = tree.item(bookmark_id, "values")
+            self._open_edit_bookmark_dialog(browser_var.get(), bookmark_id, current_name, current_url,
+                                             on_saved=lambda name, url: tree.item(bookmark_id, values=(name, url, tree.item(bookmark_id, "values")[2])))
+        
+        actions = ttk.Frame(dialog, padding=(10, 0, 10, 10))
+        actions.pack(fill="x")
+        ttk.Button(actions, text=f"🌐 Open Selected in Browser", command=open_selected).pack(side="left")
+        ttk.Button(actions, text="✏️ Edit Selected (fix broken URL)", command=edit_selected).pack(side="left", padx=(10, 0))
+        ttk.Label(actions, text="  (or double-click a result)", font=("Segoe UI", 8)).pack(side="left")
+    
+    def add_bookmark_dialog(self):
+        """Open a dialog to add a new bookmark into an existing folder"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("➕ Add Bookmark to Folder")
+        dialog.geometry("480x260")
+        dialog.transient(self.root)
+        
+        form = ttk.Frame(dialog, padding=15)
+        form.pack(fill="both", expand=True)
+        
+        ttk.Label(form, text="Browser:").grid(row=0, column=0, sticky="w", pady=5)
+        browser_var = tk.StringVar(value="edge")
+        browser_combo = ttk.Combobox(form, textvariable=browser_var, values=["edge", "chrome"], state="readonly", width=27)
+        browser_combo.grid(row=0, column=1, pady=5, sticky="w")
+        
+        ttk.Label(form, text="Name:").grid(row=1, column=0, sticky="w", pady=5)
+        name_var = tk.StringVar()
+        ttk.Entry(form, textvariable=name_var, width=40).grid(row=1, column=1, pady=5, sticky="w")
+        
+        ttk.Label(form, text="URL:").grid(row=2, column=0, sticky="w", pady=5)
+        url_var = tk.StringVar()
+        ttk.Entry(form, textvariable=url_var, width=40).grid(row=2, column=1, pady=5, sticky="w")
+        
+        ttk.Label(form, text="Folder:").grid(row=3, column=0, sticky="w", pady=5)
+        folder_var = tk.StringVar()
+        folder_combo = ttk.Combobox(form, textvariable=folder_var, values=[], state="readonly", width=37)
+        folder_combo.grid(row=3, column=1, pady=5, sticky="w")
+        
+        def refresh_folders(*_):
+            paths, error = self.migrator.list_folder_paths(browser_var.get())
+            if error:
+                folder_combo['values'] = []
+                return
+            folder_combo['values'] = paths
+            if paths:
+                folder_var.set(paths[0])
+        
+        browser_combo.bind("<<ComboboxSelected>>", refresh_folders)
+        refresh_folders()
+        
+        def do_add():
+            name, url, folder_path = name_var.get().strip(), url_var.get().strip(), folder_var.get()
+            if not name or not url or not folder_path:
+                messagebox.showwarning("⚠️ Missing Input", "Name, URL, and Folder are all required.")
+                return
+            if not self._ensure_browser_closed(browser_var.get()):
+                return
+            success, message = self.migrator.add_bookmark_to_folder(browser_var.get(), folder_path, name, url)
+            if success:
+                messagebox.showinfo("✅ Added", message)
+                dialog.destroy()
+            else:
+                messagebox.showerror("❌ Error", message)
+        
+        ttk.Button(form, text="Add Bookmark", command=do_add).grid(row=4, column=1, pady=15, sticky="e")
+    
+    def _open_edit_bookmark_dialog(self, browser_type, bookmark_id, current_name, current_url, on_saved):
+        """Small dialog to fix a broken/changed bookmark URL (or rename it) in place"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("✏️ Edit Bookmark")
+        dialog.geometry("460x180")
+        dialog.transient(self.root)
+        
+        form = ttk.Frame(dialog, padding=15)
+        form.pack(fill="both", expand=True)
+        
+        ttk.Label(form, text="Name:").grid(row=0, column=0, sticky="w", pady=5)
+        name_var = tk.StringVar(value=current_name)
+        ttk.Entry(form, textvariable=name_var, width=45).grid(row=0, column=1, pady=5, sticky="w")
+        
+        ttk.Label(form, text="URL:").grid(row=1, column=0, sticky="w", pady=5)
+        url_var = tk.StringVar(value=current_url)
+        ttk.Entry(form, textvariable=url_var, width=45).grid(row=1, column=1, pady=5, sticky="w")
+        
+        def do_save():
+            new_name, new_url = name_var.get().strip(), url_var.get().strip()
+            if not new_name or not new_url:
+                messagebox.showwarning("⚠️ Missing Input", "Name and URL are both required.")
+                return
+            if not self._ensure_browser_closed(browser_type):
+                return
+            success, message = self.migrator.update_bookmark(browser_type, bookmark_id, new_name, new_url)
+            if success:
+                messagebox.showinfo("✅ Updated", message)
+                on_saved(new_name, new_url)
+                dialog.destroy()
+            else:
+                messagebox.showerror("❌ Error", message)
+        
+        ttk.Button(form, text="Save Changes", command=do_save).grid(row=2, column=1, pady=15, sticky="e")
+    
+    def check_broken_links_dialog(self):
+        """Dialog to test every bookmark's URL and flag broken/unreachable ones"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("🩺 Check Broken Links")
+        dialog.geometry("760x480")
+        dialog.transient(self.root)
+        
+        top = ttk.Frame(dialog, padding=10)
+        top.pack(fill="x")
+        
+        ttk.Label(top, text="Browser:").pack(side="left")
+        browser_var = tk.StringVar(value="edge")
+        browser_combo = ttk.Combobox(top, textvariable=browser_var, values=["edge", "chrome"], state="readonly", width=10)
+        browser_combo.pack(side="left", padx=(5, 15))
+        
+        progress_var = tk.StringVar(value="Click Start to check all bookmark links")
+        ttk.Label(top, textvariable=progress_var).pack(side="left", padx=(0, 15))
+        
+        start_btn = ttk.Button(top, text="▶ Start Check")
+        start_btn.pack(side="left")
+        
+        results_frame = ttk.Frame(dialog, padding=(10, 0, 10, 10))
+        results_frame.pack(fill="both", expand=True)
+        
+        columns = ("name", "url", "path", "status")
+        tree = ttk.Treeview(results_frame, columns=columns, show="headings")
+        tree.heading("name", text="Name")
+        tree.heading("url", text="URL")
+        tree.heading("path", text="Folder")
+        tree.heading("status", text="Status")
+        tree.column("name", width=150)
+        tree.column("url", width=250)
+        tree.column("path", width=150)
+        tree.column("status", width=110)
+        tree.tag_configure("broken", background="#ffd6d6")
+        tree.tag_configure("error", background="#fff3cd")
+        tree.pack(side="left", fill="both", expand=True)
+        
+        scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        tree.config(yscrollcommand=scrollbar.set)
+        
+        result_queue = queue.Queue()
+        
+        def worker(browser_type):
+            def progress_cb(done, total):
+                result_queue.put(('progress', done, total))
+            results, error = self.migrator.check_bookmark_links(browser_type, progress_callback=progress_cb)
+            result_queue.put(('done', results, error))
+        
+        def poll_queue():
+            try:
+                while True:
+                    item = result_queue.get_nowait()
+                    if item[0] == 'progress':
+                        _, done, total = item
+                        progress_var.set(f"Checking... {done}/{total}")
+                    elif item[0] == 'done':
+                        _, results, error = item
+                        start_btn.config(state="normal")
+                        if error:
+                            messagebox.showerror("❌ Error", error)
+                            progress_var.set("Error")
+                            return
+                        tree.delete(*tree.get_children())
+                        broken_count = 0
+                        for r in results:
+                            tags = ()
+                            if r['status'] == 'broken':
+                                tags, broken_count = ("broken",), broken_count + 1
+                            elif r['status'] == 'error':
+                                tags, broken_count = ("error",), broken_count + 1
+                            status_text = f"{r['status']} ({r['code']})" if r.get('code') else r['status']
+                            tree.insert("", "end", iid=str(r['id']), values=(r['name'], r['url'], r['path'], status_text), tags=tags)
+                        progress_var.set(f"Done: {len(results)} checked, {broken_count} broken/unreachable")
+                        return
+            except queue.Empty:
+                pass
+            dialog.after(150, poll_queue)
+        
+        def start_check():
+            start_btn.config(state="disabled")
+            tree.delete(*tree.get_children())
+            progress_var.set("Starting...")
+            threading.Thread(target=worker, args=(browser_var.get(),), daemon=True).start()
+            dialog.after(150, poll_queue)
+        
+        start_btn.config(command=start_check)
+        
+        def get_selected():
+            selection = tree.selection()
+            if not selection:
+                messagebox.showwarning("⚠️ Nothing Selected", "Select a bookmark first.")
+                return None
+            return selection[0]
+        
+        def open_selected():
+            bid = get_selected()
+            if not bid:
+                return
+            url = tree.item(bid, "values")[1]
+            success, error = self.migrator.open_url_in_browser(browser_var.get(), url)
+            if not success:
+                messagebox.showerror("❌ Error", f"Could not open URL: {error}")
+        
+        def edit_selected():
+            bid = get_selected()
+            if not bid:
+                return
+            name, url, path, status = tree.item(bid, "values")
+            self._open_edit_bookmark_dialog(
+                browser_var.get(), bid, name, url,
+                on_saved=lambda n, u: tree.item(bid, values=(n, u, path, "unchecked - re-run to verify"), tags=())
+            )
+        
+        def remove_selected():
+            bid = get_selected()
+            if not bid:
+                return
+            name = tree.item(bid, "values")[0]
+            if not messagebox.askyesno("⚠️ Confirm Delete", f"Remove bookmark '{name}' from {browser_var.get().upper()}?"):
+                return
+            if not self._ensure_browser_closed(browser_var.get()):
+                return
+            success, message = self.migrator.delete_bookmark(browser_var.get(), bid)
+            self.status_var.set(message)
+            if success:
+                tree.delete(bid)
+            else:
+                messagebox.showerror("❌ Error", message)
+        
+        actions = ttk.Frame(dialog, padding=(10, 0, 10, 10))
+        actions.pack(fill="x")
+        ttk.Button(actions, text="🌐 Open Selected", command=open_selected).pack(side="left")
+        ttk.Button(actions, text="✏️ Edit Selected", command=edit_selected).pack(side="left", padx=(10, 0))
+        ttk.Button(actions, text="🗑️ Remove Selected", command=remove_selected).pack(side="left", padx=(10, 0))
+    
     def _ensure_browser_closed(self, browser_type):
         """Verify (and if needed, force-close) the browser process so it can't overwrite
         the Bookmarks file after we edit it. Returns True if safe to proceed."""
@@ -982,11 +1684,21 @@ IMPORTANT:
         return True
     
     def open_export_folder(self):
-        """Open the export folder in File Explorer"""
-        if os.path.exists(self.migrator.export_dir):
-            os.startfile(self.migrator.export_dir)
-        else:
+        """Open the export folder in the OS file browser, cross-platform"""
+        if not os.path.exists(self.migrator.export_dir):
             messagebox.showerror("Error", "Bookmarks backup folder not found")
+            return
+        
+        system = platform.system()
+        try:
+            if system == "Windows":
+                os.startfile(self.migrator.export_dir)
+            elif system == "Darwin":
+                subprocess.Popen(["open", self.migrator.export_dir])
+            else:
+                subprocess.Popen(["xdg-open", self.migrator.export_dir])
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open folder: {str(e)}")
 
 
 def main():
